@@ -304,7 +304,7 @@ class TSDFVolume:
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts = measure.marching_cubes_lewiner(tsdf_vol, level=0)[0]
+    verts = measure.marching_cubes(tsdf_vol, level=0)[0]
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size + self._vol_origin
 
@@ -320,14 +320,13 @@ class TSDFVolume:
     return pc
 
   def get_mesh(self):
-    """Compute a mesh from the voxel volume using marching cubes.
-    """
+    """Compute a mesh from the voxel volume using marching cubes."""
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts, faces, norms, vals = measure.marching_cubes_lewiner(tsdf_vol, level=0)
+    verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, level=0)
     verts_ind = np.round(verts).astype(int)
-    verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates
+    verts = verts*self._voxel_size+self._vol_origin
 
     # Get vertex colors
     rgb_vals = color_vol[verts_ind[:,0], verts_ind[:,1], verts_ind[:,2]]
@@ -335,9 +334,88 @@ class TSDFVolume:
     colors_g = np.floor((rgb_vals-colors_b*self._color_const)/256)
     colors_r = rgb_vals-colors_b*self._color_const-colors_g*256
     colors = np.floor(np.asarray([colors_r,colors_g,colors_b])).T
-    colors = colors.astype(np.uint8)
+    
+    # 确保颜色值在0-255范围内
+    colors = np.clip(colors, 0, 255).astype(np.uint8)
+    
+    # 转换为0-1范围的浮点数
+    colors = colors.astype(float) / 255.0
+
     return verts, faces, norms, colors
 
+  def update_bounds(self, vol_bnds):
+   """更新体素体的边界和相关参数
+   
+   Args:
+       vol_bnds (ndarray): 新的体素体边界 (3x2 numpy array)
+   """
+   vol_bnds = np.asarray(vol_bnds)
+   if np.any(self._vol_bnds != vol_bnds):
+       self._vol_bnds = vol_bnds
+       
+       # 重新计算体素网格参数
+       self._vol_dim = np.ceil((self._vol_bnds[:,1]-self._vol_bnds[:,0])/self._voxel_size).copy(order='C').astype(int)
+       self._vol_bnds[:,1] = self._vol_bnds[:,0]+self._vol_dim*self._voxel_size
+       self._vol_origin = self._vol_bnds[:,0].copy(order='C').astype(np.float32)
+       
+       # 重新分配内存
+       if self.gpu_mode:
+           # GPU模式: 重新分配GPU内存
+           old_tsdf = self._tsdf_vol_cpu.copy()
+           old_weight = self._weight_vol_cpu.copy()
+           old_color = self._color_vol_cpu.copy()
+           
+           self._tsdf_vol_cpu = np.ones(self._vol_dim).astype(np.float32)
+           self._weight_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+           self._color_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+           
+           # 复制旧数据到新分配的空间
+           old_dims = old_tsdf.shape
+           self._tsdf_vol_cpu[:old_dims[0],:old_dims[1],:old_dims[2]] = old_tsdf
+           self._weight_vol_cpu[:old_dims[0],:old_dims[1],:old_dims[2]] = old_weight
+           self._color_vol_cpu[:old_dims[0],:old_dims[1],:old_dims[2]] = old_color
+           
+           # 更新GPU内存
+           if hasattr(self, '_tsdf_vol_gpu'):
+               self._tsdf_vol_gpu.free()
+               self._weight_vol_gpu.free()
+               self._color_vol_gpu.free()
+               
+           self._tsdf_vol_gpu = cuda.mem_alloc(self._tsdf_vol_cpu.nbytes)
+           cuda.memcpy_htod(self._tsdf_vol_gpu, self._tsdf_vol_cpu)
+           self._weight_vol_gpu = cuda.mem_alloc(self._weight_vol_cpu.nbytes)
+           cuda.memcpy_htod(self._weight_vol_gpu, self._weight_vol_cpu)
+           self._color_vol_gpu = cuda.mem_alloc(self._color_vol_cpu.nbytes)
+           cuda.memcpy_htod(self._color_vol_gpu, self._color_vol_cpu)
+           
+       else:
+           # CPU模式: 重新分配CPU内存
+           old_tsdf = self._tsdf_vol_cpu.copy()
+           old_weight = self._weight_vol_cpu.copy()
+           old_color = self._color_vol_cpu.copy()
+           
+           self._tsdf_vol_cpu = np.ones(self._vol_dim).astype(np.float32)
+           self._weight_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+           self._color_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+           
+           # 复制旧数据
+           old_dims = old_tsdf.shape
+           self._tsdf_vol_cpu[:old_dims[0],:old_dims[1],:old_dims[2]] = old_tsdf
+           self._weight_vol_cpu[:old_dims[0],:old_dims[1],:old_dims[2]] = old_weight
+           self._color_vol_cpu[:old_dims[0],:old_dims[1],:old_dims[2]] = old_color
+           
+           # 更新体素坐标
+           xv, yv, zv = np.meshgrid(
+               range(self._vol_dim[0]),
+               range(self._vol_dim[1]),
+               range(self._vol_dim[2]),
+               indexing='ij'
+           )
+           self.vox_coords = np.concatenate([
+               xv.reshape(1,-1),
+               yv.reshape(1,-1),
+               zv.reshape(1,-1)
+           ], axis=0).astype(int).T
 
 def rigid_transform(xyz, transform):
   """Applies a rigid transform to an (N, 3) pointcloud.
@@ -423,3 +501,4 @@ def pcwrite(filename, xyzrgb):
       xyz[i, 0], xyz[i, 1], xyz[i, 2],
       rgb[i, 0], rgb[i, 1], rgb[i, 2],
     ))
+
